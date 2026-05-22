@@ -114,9 +114,9 @@ Output là URL với host đã rewrite từ `checkout.stripe.com` → `pay.opena
 
 CLI subcommands chỉ phục vụ 1 lần signup hoặc helper TOTP/2FA — workflow batch khuyên dùng web UI.
 
-#### Mode A — iCloud mail qua Worker `icloud-cf-mail`
+#### Mode A — iCloud mail qua Worker [`icloud-cf-mail`](https://github.com/6c696e68/icloud-cf-mail)
 
-Email `*@icloud.com` được forward về Cloudflare Worker:
+Email `*@icloud.com` được forward về Cloudflare Worker (xem [hướng dẫn deploy](https://github.com/6c696e68/icloud-cf-mail)):
 
 ```bash
 .venv/bin/python -m gpt_signup_hybrid signup --email foo@icloud.com
@@ -352,6 +352,8 @@ Server suppress hầu hết uvicorn log để chừa stdout cho job log.
 ## 5. Mail provider chi tiết
 
 ### 5.1 `WorkerMailProvider` — iCloud relay
+
+**Source**: [github.com/6c696e68/icloud-cf-mail](https://github.com/6c696e68/icloud-cf-mail) — Cloudflare Worker nhận mail forward từ iCloud và expose REST API để poll OTP. Repo có hướng dẫn deploy đầy đủ.
 
 - GET `<logs_url>?mail=<email>` với header `Authorization: Bearer <api_key>`.
 - Parse JSON response: list trực tiếp hoặc `{messages|items|logs|emails|data: [...]}`.
