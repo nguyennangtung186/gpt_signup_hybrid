@@ -20,6 +20,25 @@ from ..signup import run_signup
 from .mail_modes import MailModeParseError, get_spec
 
 
+def _append_account_log(
+    *, session_dir: Path, email: str, password: str, totp_secret: str
+) -> None:
+    """Append 1 dòng email|password|totp_secret vào accounts.txt tổng hợp."""
+    log_path = session_dir / "accounts.txt"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    line = f"{email}|{password}|{totp_secret}\n"
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(line)
+
+
+def _append_link_log(*, session_dir: Path, payment_link: str) -> None:
+    """Append payment_link vào links.txt."""
+    log_path = session_dir / "links.txt"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(f"{payment_link}\n")
+
+
 # ── Load .env riêng của gpt_signup_hybrid ─────────────────────────────
 def _load_hybrid_env() -> dict[str, str]:
     """Đọc gpt_signup_hybrid/.env (cùng thư mục package root)."""
@@ -583,14 +602,21 @@ class JobManager:
                 self._broadcast_job(job)
                 return
 
-            two_fa_path = Path(job.session_path).with_suffix(".2fa.json")
-            two_fa_path.write_text(
-                json.dumps({
-                    "email": job.email,
-                    "user_id": job.user_id,
-                    "two_factor": mfa_result,
-                }, indent=2, ensure_ascii=False),
+            # Merge two_factor vào file signup .json chính
+            session_file = Path(job.session_path)
+            sdata["two_factor"] = mfa_result
+            session_file.write_text(
+                json.dumps(sdata, indent=2, ensure_ascii=False),
                 encoding="utf-8",
+            )
+
+            # Ghi vào file tổng hợp accounts.txt
+            settings = load_settings()
+            _append_account_log(
+                session_dir=runtime_session_dir(settings),
+                email=job.email,
+                password=sdata.get("password") or "",
+                totp_secret=mfa_result.get("secret") or "",
             )
 
             job.secret = mfa_result.get("secret")
@@ -688,19 +714,24 @@ class JobManager:
                 self._broadcast_job(job)
                 return
 
-            # Lưu .2fa.json kèm
-            two_fa_path = session_path.with_suffix(".2fa.json")
-            two_fa_path.write_text(
-                json.dumps({
-                    "email": job.email,
-                    "user_id": job.user_id,
-                    "two_factor": mfa_result,
-                }, indent=2, ensure_ascii=False),
+            # Lưu .2fa.json kèm → merge vào session JSON chính
+            existing = json.loads(session_path.read_text(encoding="utf-8"))
+            existing["two_factor"] = mfa_result
+            session_path.write_text(
+                json.dumps(existing, indent=2, ensure_ascii=False),
                 encoding="utf-8",
             )
 
             job.secret = mfa_result.get("secret")
             job.first_code = mfa_result.get("first_code")
+
+            # Ghi vào file tổng hợp accounts.txt
+            _append_account_log(
+                session_dir=runtime_session_dir(settings),
+                email=job.email,
+                password=result.password or "",
+                totp_secret=mfa_result.get("secret") or "",
+            )
 
             # Post-reg optional steps
             if self._post_reg_get_session or self._post_reg_get_link:
@@ -747,18 +778,28 @@ class JobManager:
             except Exception as exc:
                 self._job_log(job, f"[post-reg] get-session failed: {exc}")
 
-        # Get Link (dùng access_token có sẵn — không re-login)
+        # Get Link (dùng access_token có sẵn — không re-login, retry tối đa 3 lần)
         if self._post_reg_get_link:
-            try:
-                self._job_log(job, "[post-reg] fetching payment link...")
-                if not access_token:
-                    raise RuntimeError("access_token rỗng từ SignupResult")
+            if not access_token:
+                self._job_log(job, "[post-reg] get-link skipped: access_token rỗng")
+            else:
                 from ..payment_link import get_checkout_url
-                url = await get_checkout_url(access_token, proxy=self._proxy)
-                job.payment_link = url
-                self._job_log(job, f"[post-reg] payment link: {url}")
-            except Exception as exc:
-                self._job_log(job, f"[post-reg] get-link failed: {exc}")
+                for attempt in range(1, 4):
+                    try:
+                        self._job_log(job, f"[post-reg] fetching payment link (attempt {attempt}/3)...")
+                        url = await get_checkout_url(access_token, proxy=self._proxy)
+                        job.payment_link = url
+                        self._job_log(job, f"[post-reg] payment link: {url}")
+                        settings = load_settings()
+                        _append_link_log(
+                            session_dir=runtime_session_dir(settings),
+                            payment_link=url,
+                        )
+                        break
+                    except Exception as exc:
+                        self._job_log(job, f"[post-reg] get-link attempt {attempt} failed: {exc}")
+                        if attempt == 3:
+                            self._job_log(job, "[post-reg] get-link failed after 3 attempts")
 
 
 # Singleton
@@ -1731,6 +1772,17 @@ class LinkJobManager:
             job.status = "success"
             job.finished_at = time.time()
             log(f"[link] success: {url}")
+
+            # Ghi vào links.txt tổng hợp
+            try:
+                settings = load_settings()
+                _append_link_log(
+                    session_dir=runtime_session_dir(settings),
+                    payment_link=url,
+                )
+            except Exception as _save_exc:
+                log(f"[link] save links.txt failed: {_save_exc}")
+
             self._broadcast_job(job)
 
         except asyncio.CancelledError:

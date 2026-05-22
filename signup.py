@@ -12,6 +12,7 @@ from .mail_providers import (
     MailProvider,
     OutlookComboError,
     OutlookProviderUnavailable,
+    build_provider_dongvanfb,
     build_provider_gmail_advanced,
     build_provider_outlook,
     build_provider_worker,
@@ -25,9 +26,8 @@ def _build_mail_provider(request: SignupRequest, *, settings) -> MailProvider:
     if request.mail_provider == "outlook":
         if not request.outlook_combo:
             raise ValueError("mail_provider='outlook' yêu cầu --outlook-combo")
-        return build_provider_outlook(
+        return build_provider_dongvanfb(
             combo=request.outlook_combo,
-            state_dir=settings.runtime_dir / "outlook_state",
             proxy=request.proxy,
         )
     if request.mail_provider == "gmail_advanced":

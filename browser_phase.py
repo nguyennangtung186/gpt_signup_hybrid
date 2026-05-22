@@ -327,6 +327,22 @@ async def _detect_screen(page) -> str:
     if "/create-account/password" in cur:
         return "password_create"
     if "/log-in/password" in cur:
+        # SPA case: URL vẫn là /log-in/password nhưng content đã chuyển sang OTP form
+        # hoặc "Check your inbox" page (email verification sau login)
+        try:
+            otp_input = page.locator('input[name="code"], input[autocomplete="one-time-code"]').first
+            if await otp_input.is_visible(timeout=200):
+                return "otp"
+        except Exception:
+            pass
+        try:
+            inbox_el = page.locator(
+                'text="Check your inbox", text="Check your email", text="Enter the verification code"'
+            ).first
+            if await inbox_el.is_visible(timeout=200):
+                return "otp"
+        except Exception:
+            pass
         return "password_login"
     # /email-verification: ƯU TIÊN button "Continue with password" để bắt buộc set password
     # Nếu cả OTP input và password button cùng visible, password button thắng
@@ -337,7 +353,7 @@ async def _detect_screen(page) -> str:
                 return "continue"
         except Exception:
             pass
-    # OTP form (URL có thể là /email-verification hoặc /email-otp)
+    # OTP form (URL có thể là /email-verification, /email-otp, /log-in/email-verification, ...)
     try:
         otp_input = page.locator('input[name="code"], input[autocomplete="one-time-code"]').first
         if await otp_input.is_visible(timeout=200):
@@ -352,11 +368,11 @@ async def _detect_screen(page) -> str:
 async def _drive_signup_flow(
     *, ctx, page, request, mail_provider, callback_holder, otp_started_at, log,
     overall_timeout: float = 240.0,
-) -> tuple[str, float]:
+) -> tuple[str, float, bool]:
     """State machine: check URL/DOM hiện tại, dispatch handler tương ứng.
     Lặp đến khi đến được chatgpt.com (có session) hoặc gặp lỗi không phục hồi.
 
-    Returns: (callback_url, otp_seconds).
+    Returns: (callback_url, otp_seconds, one_time_code_mode).
     """
     deadline = time.monotonic() + overall_timeout
     otp_seconds_total = 0.0
@@ -365,6 +381,7 @@ async def _drive_signup_flow(
     login_attempted = False
     continue_clicked = False
     otp_submitted = False
+    one_time_code_mode = False  # True sau khi click "Log in with a one-time code"
     tried_codes: set[str] = set()  # codes đã submit + bị reject
     pending_codes: list[str] = []  # codes chưa submit (mail delay catch)
     last_screen = None
@@ -372,6 +389,10 @@ async def _drive_signup_flow(
 
     while time.monotonic() < deadline:
         screen = await _detect_screen(page)
+        # Trong one-time code login flow, /email-verification hiển thị "Continue with password"
+        # nhưng ta muốn lấy OTP, không quay lại password
+        if one_time_code_mode and screen == "continue":
+            screen = "otp"
         if screen != last_screen:
             log(f"[flow] screen={screen} url={page.url.split('?')[0]}")
             last_screen = screen
@@ -381,7 +402,7 @@ async def _drive_signup_flow(
 
         if screen == "chatgpt":
             await _wait_chatgpt_session(ctx, page, timeout_seconds=30.0, log=log)
-            return callback_holder.get("url") or page.url, otp_seconds_total
+            return callback_holder.get("url") or page.url, otp_seconds_total, one_time_code_mode
 
         if screen == "auth_error":
             raise BrowserPhaseError(f"auth error page: {page.url}")
@@ -432,6 +453,24 @@ async def _drive_signup_flow(
 
         if screen == "password_login":
             if login_attempted:
+                # Detect sai password → click "Log in with a one-time code" để dùng OTP thay thế
+                if same_screen_count >= 3:
+                    try:
+                        err_el = page.locator('[role="alert"], [class*="error"]').first
+                        err_text = await err_el.text_content(timeout=300)
+                        if err_text and any(k in err_text.lower() for k in ("incorrect", "wrong", "invalid")):
+                            log(f"[flow] login password wrong ({err_text.strip()[:60]}) — trying 'Log in with a one-time code'")
+                            otc_btn = page.locator(
+                                'button:has-text("Log in with a one-time code"), '
+                                'a:has-text("Log in with a one-time code")'
+                            ).first
+                            await otc_btn.click(timeout=5000)
+                            log("[flow] clicked 'Log in with a one-time code' — waiting for OTP screen")
+                            one_time_code_mode = True
+                            await asyncio.sleep(2.0)
+                            continue
+                    except Exception:
+                        pass
                 await asyncio.sleep(1.0)
                 continue
             log("[flow] login with password")
@@ -628,6 +667,19 @@ async def _drive_signup_flow(
             continue
 
         if screen == "about_you":
+            # Set password TRƯỚC khi fill about_you — page vẫn còn trên auth.openai.com,
+            # session OTP vừa verify → register endpoint chấp nhận set password mới.
+            if one_time_code_mode:
+                try:
+                    reg = await page.evaluate(
+                        _REGISTER_USER_JS,
+                        {"username": request.email, "password": request.password},
+                    )
+                    st = reg.get("status") if isinstance(reg, dict) else None
+                    bd = reg.get("body") if isinstance(reg, dict) else reg
+                    log(f"[flow] set password (about_you ctx): HTTP {st}: {str(bd)[:100]}")
+                except Exception as exc:
+                    log(f"[flow] set password (about_you ctx) failed: {exc}")
             try:
                 await _wait_oai_sc(ctx, timeout_seconds=15, log=log)
             except BrowserPhaseError:
@@ -638,7 +690,7 @@ async def _drive_signup_flow(
             )
             # Sau /about-you có thể vẫn còn step (rare), tiếp tục loop để chờ chatgpt.com
             await _wait_chatgpt_session(ctx, page, timeout_seconds=60.0, log=log)
-            return callback_url, otp_seconds_total
+            return callback_url, otp_seconds_total, one_time_code_mode
 
         # screen == 'unknown' → đợi page settle
         await asyncio.sleep(0.7)
@@ -1080,7 +1132,7 @@ async def run_browser_phase(
             # Mốc check-point: sắp drive flow (sẽ trigger OTP send).
             _mark_otp_started()
 
-            _callback_url, _otp_seconds = await _drive_signup_flow(
+            _callback_url, _otp_seconds, _used_one_time_code = await _drive_signup_flow(
                 ctx=ctx, page=page, request=request,
                 mail_provider=mail_provider,
                 callback_holder=callback_holder,
@@ -1144,7 +1196,7 @@ async def run_browser_phase(
             # Mốc check-point: sắp drive flow (sẽ trigger OTP send).
             _mark_otp_started()
 
-            _callback_url, _otp_seconds = await _drive_signup_flow(
+            _callback_url, _otp_seconds, _used_one_time_code = await _drive_signup_flow(
                 ctx=ctx, page=page, request=request,
                 mail_provider=mail_provider,
                 callback_holder=callback_holder,

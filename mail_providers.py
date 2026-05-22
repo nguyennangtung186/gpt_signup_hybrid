@@ -1,8 +1,9 @@
 """Mail providers cho OTP polling.
 
-2 backends:
+3 backends:
     - WorkerMailProvider: Cloudflare Worker logs API (icloud-cf-mail style).
     - OutlookMailProvider: Microsoft Graph API qua refresh_token (combo Outlook).
+    - DongVanFBOutlookProvider: dongvanfb.net API qua refresh_token (combo Outlook).
 
 Mỗi provider có method:
     async def poll_otp(*, recipient, started_at, timeout_seconds, poll_interval_seconds, log) -> str
@@ -278,7 +279,10 @@ _DEFAULT_SCOPE = "https://graph.microsoft.com/.default offline_access"
 _OTP_FOLDERS = ("Inbox", "Junk Email")
 
 # Microsoft refresh / Graph: timeout tổng 12s, connect 6s — đủ để fail nhanh + retry.
+# read=12s là per-byte-interval, KHÔNG phải tổng response time.
+# Hard cap tổng dùng asyncio.wait_for trong _ensure_access.
 _OUTLOOK_HTTP_TIMEOUT = httpx.Timeout(connect=6.0, read=12.0, write=12.0, pool=6.0)
+_OUTLOOK_REFRESH_TOTAL_TIMEOUT = 15.0  # hard cap cho toàn bộ token refresh (s)
 
 # Sau N lần network/HTTP transient liên tiếp → coi combo này transient-dead trong run hiện tại.
 # Raise terminal error để job kết thúc nhanh thay vì chờ OTP timeout (180s).
@@ -452,7 +456,16 @@ class OutlookMailProvider:
     async def _ensure_access(self, *, log) -> str:
         if self._access_token and time.monotonic() < self._access_expires_at:
             return self._access_token
-        await self._refresh_access(log=log)
+        try:
+            await asyncio.wait_for(
+                self._refresh_access(log=log),
+                timeout=_OUTLOOK_REFRESH_TOTAL_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            raise OutlookProviderUnavailable(
+                f"refresh token request timed out after {_OUTLOOK_REFRESH_TOTAL_TIMEOUT}s "
+                f"(login.microsoftonline.com không phản hồi)"
+            )
         assert self._access_token
         return self._access_token
 
@@ -568,6 +581,165 @@ class OutlookMailProvider:
                 except OutlookComboError as exc:
                     log(f"[otp:outlook] auth error attempt {attempt}: {exc}")
                     raise
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"OTP timeout after {timeout_seconds}s for {self.combo.email}"
+                    )
+                await asyncio.sleep(min(poll_interval_seconds, remaining))
+
+
+# ─────────────────────────────────────────────────────────────────────
+# DongVanFB Outlook provider (tools.dongvanfb.net API)
+# ─────────────────────────────────────────────────────────────────────
+
+_DONGVANFB_URL = "https://tools.dongvanfb.net/api/get_messages_oauth2"
+_DONGVANFB_HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=20.0, write=10.0, pool=6.0)
+_DONGVANFB_HEADERS = {
+    "Accept": "*/*",
+    "Content-Type": "application/json",
+    "Origin": "https://dongvanfb.net",
+    "Referer": "https://dongvanfb.net/",
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
+    ),
+}
+
+
+def _parse_dongvanfb_date(date_str: str) -> datetime | None:
+    """Parse format 'HH:MM - DD/MM/YYYY' từ dongvanfb API."""
+    if not date_str:
+        return None
+    try:
+        dt = datetime.strptime(date_str.strip(), "%H:%M - %d/%m/%Y")
+        return dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+class DongVanFBOutlookProvider:
+    """Poll OTP Outlook qua API tools.dongvanfb.net/api/get_messages_oauth2.
+
+    Request body: {"email": ..., "pass": ..., "refresh_token": ..., "client_id": ...}
+    Response:
+        {
+            "email": "...",
+            "status": true,
+            "messages": [
+                {
+                    "from": "noreply@tm.openai.com",
+                    "subject": "Your temporary ChatGPT login code",
+                    "code": "",
+                    "message": "<html>...957952...</html>",
+                    "date": "19:20 - 20/05/2026"
+                },
+                ...
+            ],
+            "content": "Mail loaded successfully."
+        }
+    """
+
+    def __init__(self, *, combo: OutlookCombo, proxy: str | None = None):
+        self.combo = combo
+        self.proxy = proxy.strip() if isinstance(proxy, str) and proxy.strip() else None
+
+    def _build_client(self) -> httpx.AsyncClient:
+        kwargs: dict[str, Any] = {"timeout": _DONGVANFB_HTTP_TIMEOUT}
+        if self.proxy:
+            kwargs["proxy"] = self.proxy
+        return httpx.AsyncClient(**kwargs)
+
+    async def poll_otp(
+        self,
+        *,
+        recipient: str,
+        started_at: datetime,
+        timeout_seconds: float,
+        poll_interval_seconds: float,
+        log,
+    ) -> str:
+        deadline = time.monotonic() + max(timeout_seconds, 1.0)
+        log(f"[otp:dongvanfb] polling {self.combo.email} (timeout {timeout_seconds:.0f}s)")
+
+        payload = {
+            "email": self.combo.email,
+            "pass": self.combo.password,
+            "refresh_token": self.combo.refresh_token,
+            "client_id": self.combo.client_id,
+        }
+
+        async with self._build_client() as client:
+            attempt = 0
+            consecutive_errors = 0
+            while True:
+                attempt += 1
+                try:
+                    response = await client.post(
+                        _DONGVANFB_URL,
+                        headers=_DONGVANFB_HEADERS,
+                        json=payload,
+                    )
+                    if response.status_code != 200:
+                        log(f"[otp:dongvanfb] HTTP {response.status_code} attempt {attempt}")
+                        consecutive_errors += 1
+                    else:
+                        data = response.json()
+                        consecutive_errors = 0
+
+                        if not data.get("status"):
+                            content = data.get("content", "")
+                            log(f"[otp:dongvanfb] status=false attempt {attempt}: {content}")
+                        else:
+                            messages: list[dict] = data.get("messages") or []
+                            for msg in messages:
+                                # Filter theo thời gian — bỏ mail cũ trước started_at
+                                msg_dt = _parse_dongvanfb_date(msg.get("date") or "")
+                                if msg_dt is not None and started_at is not None:
+                                    if msg_dt < started_at:
+                                        continue
+
+                                sender = str(msg.get("from") or "")
+                                subject = str(msg.get("subject") or "")
+
+                                # Thử field "code" trước (API đôi khi fill sẵn)
+                                code = str(msg.get("code") or "").strip()
+                                if not (code and len(code) == 6 and code.isdigit()):
+                                    # Extract từ HTML body
+                                    body_html = str(msg.get("message") or "")
+                                    code = _extract_otp(subject, body_html) or ""
+
+                                if code and (_is_openai_sender(sender) or "openai" in subject.lower()):
+                                    log(
+                                        f"[otp:dongvanfb] found {code} "
+                                        f"(sender={sender} attempt {attempt})"
+                                    )
+                                    return code
+                                elif code:
+                                    log(
+                                        f"[otp:dongvanfb] suspicious code {code} "
+                                        f"from {sender!r} — skip (non-OpenAI sender)"
+                                    )
+
+                            if attempt <= 3 or attempt % 5 == 0:
+                                log(f"[otp:dongvanfb] no OTP yet, {len(messages)} messages (attempt {attempt})")
+
+                    if consecutive_errors >= 3:
+                        raise OutlookProviderUnavailable(
+                            f"dongvanfb API thất bại {consecutive_errors} lần liên tiếp"
+                        )
+
+                except (httpx.HTTPError, ValueError) as exc:
+                    consecutive_errors += 1
+                    log(
+                        f"[otp:dongvanfb] error attempt {attempt} "
+                        f"({consecutive_errors}/3): {type(exc).__name__}: {exc!r}"
+                    )
+                    if consecutive_errors >= 3:
+                        raise OutlookProviderUnavailable(
+                            f"dongvanfb API lỗi network {consecutive_errors} lần liên tiếp: {exc}"
+                        ) from exc
 
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -771,6 +943,13 @@ def build_provider_outlook(
 ) -> OutlookMailProvider:
     parsed = OutlookCombo.parse(combo)
     return OutlookMailProvider(combo=parsed, state_dir=state_dir, proxy=proxy)
+
+
+def build_provider_dongvanfb(
+    *, combo: str, proxy: str | None = None,
+) -> DongVanFBOutlookProvider:
+    parsed = OutlookCombo.parse(combo)
+    return DongVanFBOutlookProvider(combo=parsed, proxy=proxy)
 
 
 def build_provider_gmail_advanced(
